@@ -60,6 +60,7 @@ from litserve.utils import (
     call_after_stream,
     configure_logging,
     is_package_installed,
+    parse_size,
 )
 
 _MCP_AVAILABLE = is_package_installed("mcp")
@@ -286,7 +287,7 @@ class BaseRequestHandler(ABC):
             return await request.json()
         return request
 
-    async def _submit_request(self, payload: dict) -> tuple[str, asyncio.Event]:
+    async def _submit_request(self, payload: dict, headers: Optional[dict] = None) -> tuple[str, asyncio.Event]:
         """Submit request to worker queue."""
         request_queue = self.server._get_request_queue(self.lit_api.api_path)
         response_queue_id = self.server.app.response_queue_id
@@ -299,24 +300,24 @@ class BaseRequestHandler(ABC):
             litserver=self.server,
         )
 
-        request_queue.put((response_queue_id, uid, time.monotonic(), payload))
+        request_queue.put((response_queue_id, uid, time.monotonic(), payload, headers or {}))
         logger.debug(f"Submitted request uid={uid}")
         return uid, response_queue_id
 
     @abstractmethod
-    async def handle_request(self, request, request_type) -> Response:
+    async def handle_request(self, request, request_type, headers: Optional[dict] = None) -> Response:
         pass
 
 
 class RegularRequestHandler(BaseRequestHandler):
-    async def handle_request(self, request, request_type) -> Response:
+    async def handle_request(self, request, request_type, headers: Optional[dict] = None) -> Response:
         try:
             logger.debug(f"Handling request: {request}")
             # Prepare request
             payload = await self._prepare_request(request, request_type)
 
             # Submit to worker
-            uid, _ = await self._submit_request(payload)
+            uid, _ = await self._submit_request(payload, headers)
 
             # Wait for response
             event = asyncio.Event()
@@ -363,13 +364,13 @@ class RegularRequestHandler(BaseRequestHandler):
 
 
 class StreamingRequestHandler(BaseRequestHandler):
-    async def handle_request(self, request, request_type) -> StreamingResponse:
+    async def handle_request(self, request, request_type, headers: Optional[dict] = None) -> StreamingResponse:
         try:
             # Prepare request
             payload = await self._prepare_request(request, request_type)
 
             # Submit to worker
-            uid, _ = await self._submit_request(payload)
+            uid, _ = await self._submit_request(payload, headers)
 
             # Set up streaming response
             event = asyncio.Event()
@@ -525,10 +526,11 @@ class LitServer:
 
     Content & Middleware:
         max_payload_size:
-            Maximum request size. Defaults to "100MB".
+            Maximum request size. Defaults to None (no limit).
 
-            - String format: "10MB", "1GB"
+            - String format: "500KB", "10MB", "1GB" (binary units, 1KB = 1024 bytes)
             - Integer format: bytes (1048576 for 1MB)
+            - Invalid or non-positive values raise a ValueError
             - Increase for large images/videos
 
         middlewares:
@@ -694,7 +696,7 @@ class LitServer:
         enable_shutdown_api: bool = False,
         model_metadata: Optional[dict] = None,
         spec: Optional[LitSpec] = None,
-        max_payload_size=None,
+        max_payload_size: Optional[Union[int, float, str]] = None,
         track_requests: bool = False,
         callbacks: Optional[Union[list[Callback], Callback]] = None,
         middlewares: Optional[list[Union[Callable, tuple[Callable, dict]]]] = None,
@@ -817,6 +819,7 @@ class LitServer:
         if not self.litapi_connector.any_stream():
             middlewares.append((GZipMiddleware, {"minimum_size": 1000}))
         if max_payload_size is not None:
+            max_payload_size = parse_size(max_payload_size, name="max_payload_size")
             middlewares.append((MaxSizeMiddleware, {"max_size": max_payload_size}))
         self.active_counters: list[mp.Value] = []
         self.middlewares = middlewares
@@ -1002,6 +1005,14 @@ class LitServer:
             data_available.clear()
 
     @property
+    def _internal_paths(self) -> list[str]:
+        """Paths of LitServe's own endpoints (not user inference requests)."""
+        paths = ["/", "/metrics", self.healthcheck_path, self.info_path]
+        if self.enable_shutdown_api:
+            paths.append(self._shutdown_path)
+        return paths
+
+    @property
     def active_requests(self):
         if self.track_requests and self.active_counters:
             return sum(counter.value for counter in self.active_counters)
@@ -1090,8 +1101,20 @@ class LitServer:
         handler = StreamingRequestHandler(lit_api, self) if lit_api.stream else RegularRequestHandler(lit_api, self)
 
         # Create endpoint function
-        async def endpoint_handler(request: request_type) -> response_type:
-            return await handler.handle_request(request, request_type)
+        if request_type == Request:
+
+            async def endpoint_handler(request: Request) -> response_type:
+                return await handler.handle_request(request, request_type, headers=dict(request.headers))
+
+        else:
+            # `request` is the parsed model, so headers come from `raw_request`. It is None when MCP calls this
+            # handler directly. Keep the bare `Request` annotation: FastAPI rejects `Optional[Request]`.
+            async def endpoint_handler(
+                request: request_type,
+                raw_request: Request = None,  # type: ignore
+            ) -> response_type:
+                headers = dict(raw_request.headers) if raw_request is not None else {}
+                return await handler.handle_request(request, request_type, headers=headers)
 
         # Register endpoint
         if not lit_api.spec:
@@ -1518,7 +1541,9 @@ class LitServer:
             # Add middleware to count active requests
             active_counter = mp.Value("i", 0, lock=True)
             self.active_counters.append(active_counter)
-            app.add_middleware(RequestCountMiddleware, active_counter=active_counter)
+            app.add_middleware(
+                RequestCountMiddleware, active_counter=active_counter, excluded_paths=self._internal_paths
+            )
 
     def _start_server(self, port, num_uvicorn_servers, log_level, sockets, uvicorn_worker_type, **kwargs):
         workers = []

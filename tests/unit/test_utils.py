@@ -3,6 +3,7 @@ import logging
 import os
 import pickle
 import sys
+import threading
 from pathlib import Path
 from unittest import mock
 from unittest.mock import MagicMock
@@ -18,6 +19,7 @@ from litserve.utils import (
     dump_exception,
     generate_random_zmq_address,
     is_package_installed,
+    parse_size,
     set_trace_if_debug,
 )
 
@@ -30,6 +32,39 @@ def test_dump_exception():
     isinstance(pickle.loads(dump_exception(exc)), HTTPException)
     assert pickle.loads(dump_exception(exc)).detail == "Custom Lit error"
     assert pickle.loads(dump_exception(exc)).status_code == 400
+
+
+class InitArgsError(Exception):
+    """Pickles fine, but cannot be unpickled because ``__init__`` needs two arguments."""
+
+    def __init__(self, msg, code):
+        super().__init__(msg)
+        self.code = code
+
+
+def _exception_with_lock():
+    exc = ValueError("boom")
+    exc.lock = threading.Lock()
+    return exc
+
+
+@pytest.mark.parametrize(
+    ("exc", "type_name", "message"),
+    [
+        (_exception_with_lock(), "ValueError", "boom"),
+        (InitArgsError("bad init", 7), "InitArgsError", "bad init"),
+    ],
+)
+def test_dump_exception_falls_back_to_runtime_error(exc, type_name, message, caplog, monkeypatch):
+    # litserve's logger sets propagate=False, so caplog misses it by default
+    monkeypatch.setattr(logging.getLogger("litserve"), "propagate", True)
+    with caplog.at_level(logging.WARNING, logger="litserve.utils"):
+        loaded = pickle.loads(dump_exception(exc))
+
+    assert isinstance(loaded, RuntimeError)
+    assert type_name in str(loaded)
+    assert message in str(loaded)
+    assert f"Could not pickle {type_name}" in caplog.text
 
 
 async def dummy_streamer():
@@ -164,3 +199,10 @@ def test_add_ssl_context_from_env_with_one_env_var_missing():
     with mock.patch.dict(os.environ, {"LIGHTNING_CERT_PEM": b64_cert}, clear=True):
         ssl_context = add_ssl_context_from_env({})
         assert ssl_context == {}
+
+
+def test_parse_size():
+    assert parse_size("1.5MB") == 1572864
+    assert parse_size(10**400) == 10**400
+    with pytest.raises(ValueError, match="^size must be a positive number"):
+        parse_size("0.0001KB")
